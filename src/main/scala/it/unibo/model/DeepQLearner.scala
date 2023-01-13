@@ -2,7 +2,7 @@ package it.unibo.model
 
 import it.unibo.model.Agent.Training
 import it.unibo.model.network.torch._
-import it.unibo.model.network.{DQN, NeuralNetworkEncoding}
+import it.unibo.model.network.{DQN, DQNGNN, NeuralNetworkEncoding}
 import it.unibo.util.LiveLogger
 import me.shadaj.scalapy.py
 import me.shadaj.scalapy.py.{PyQuote, SeqConverters}
@@ -23,12 +23,18 @@ class DeepQLearner[State, Action](
 )(implicit encoding: NeuralNetworkEncoding[State], random: Random)
     extends Agent[State, Action] {
   private var updates = 0
-  private val targetNetwork = DQN(encoding.elements, hiddenSize, actionSpace.size)
-  private val policyNetwork = DQN(encoding.elements, hiddenSize, actionSpace.size)
+  private val targetNetwork = DQNGNN(2, hiddenSize, actionSpace.size)
+  private val policyNetwork = DQNGNN(2, hiddenSize, actionSpace.size)
   private val targetPolicy = DeepQLearner.policyFromNetwork(policyNetwork, encoding, actionSpace)
   private val behaviouralPolicy = DeepQLearner.policyFromNetwork(policyNetwork, encoding, actionSpace)
   private val optimizer = optim.RMSprop(policyNetwork.parameters(), learningRate)
-
+  val neigh = 5
+  val True = torch.tensor(Seq(true).toPythonCopy)
+  /*index = [torch.zeros(neigh-1, dtype=torch.bool) for _ in range(num_graphs)]
+  index = [torch.concat((True, x)) for x in index]
+  index = torch.stack(index)
+  index = torch.flatten(index)
+  index*/
   val optimal: State => Action = targetPolicy
 
   val behavioural: State => Action = state =>
@@ -40,14 +46,37 @@ class DeepQLearner[State, Action](
     memory.insert(state, action, reward, nextState)
 
   override def improve(): Unit = if (this.mode == Training) {
+    val neighborhoodIndex = List(List.fill(5)(0) ::: List.range(1, 6), (List.range(1, 6)) ::: List.fill(5)(0))
+    val neighborhoodIndexPython = neighborhoodIndex.map(_.toPythonCopy).toPythonCopy
+    val neighborhoodIndexTorch = torch.tensor(neighborhoodIndexPython)
     val memorySample = memory.sample(batchSize)
     if (memory.sample(batchSize).size == batchSize) {
-      val states = memorySample.map(_.state).toSeq.map(state => encoding.toSeq(state).toPythonCopy).toPythonCopy
+      // val states = memorySample.map(_.state).toSeq.map(state => encoding.toSeq(state).toPythonCopy).toPythonCopy
+      val states = memorySample.map(_.state).toSeq.map(state => encoding.toTensor(state))
+      val indexes = states.map(_ => neighborhoodIndexTorch)
+      val graphsState = states.zip(indexes).map { case (x, index) => geometric.data.Data(x = x, edge_index = index) }
+      val batchState = geometric.data.Batch.from_data_list(graphsState.toPythonCopy)
+      val masks = states.map(state => torch.zeros(neigh, dtype = torch.bool))
+      val maskWithMe = masks.map(mask => torch.cat(Seq(True, mask).toPythonCopy))
+      val stackedMask = torch.stack(maskWithMe.toPythonCopy)
+      val flattenMask = torch.flatten(stackedMask)
       val action = memorySample.map(_.action).toSeq.map(action => actionSpace.indexOf(action)).toPythonCopy
       val rewards = torch.tensor(memorySample.map(_.reward).toSeq.toPythonCopy)
-      val nextState = memorySample.map(_.nextState).toSeq.map(state => encoding.toSeq(state).toPythonCopy).toPythonCopy
-      val stateActionValue = policyNetwork(torch.tensor(states)).gather(1, torch.tensor(action).view(batchSize, 1))
-      val nextStateValues = targetNetwork(torch.tensor(nextState)).max(1).bracketAccess(0).detach()
+      // val nextState = memorySample.map(_.nextState).toSeq.map(state => encoding.toSeq(state).toPythonCopy).toPythonCopy
+      val nextState = memorySample.map(_.state).toSeq.map(state => encoding.toTensor(state))
+      val graphsNextState =
+        nextState.zip(indexes).map { case (x, index) => geometric.data.Data(x = x, edge_index = index) }
+      val batchNextState = geometric.data.Batch.from_data_list(graphsNextState.toPythonCopy)
+      val stateActionValue = policyNetwork(batchState.x, batchState.edge_index)
+        .bracketAccess(flattenMask)
+        .gather(1, torch.tensor(action).view(batchSize, 1))
+      val nextStateValues = targetNetwork(batchNextState.x, batchNextState.edge_index)
+        .bracketAccess(flattenMask)
+        .max(1)
+        .bracketAccess(0)
+        .detach()
+      /*val stateActionValue = policyNetwork(torch.tensor(states)).gather(1, torch.tensor(action).view(batchSize, 1))
+      val nextStateValues = targetNetwork(torch.tensor(nextState)).max(1).bracketAccess(0).detach()*/
       val expectedValue = (nextStateValues * gamma) + rewards
       val criterion = nn.SmoothL1Loss()
       val loss = criterion(stateActionValue, expectedValue.unsqueeze(1))
@@ -83,11 +112,15 @@ object DeepQLearner {
 
   def policyFromNetwork[S, A](network: py.Dynamic, encoding: NeuralNetworkEncoding[S], actionSpace: Seq[A]): S => A = {
     state =>
-      val netInput = encoding.toSeq(state)
+      val netInput = encoding.toTensor(state)
+      val neighborhoodIndex = List(List.fill(5)(0) ::: List.range(1, 6), (List.range(1, 6)) ::: List.fill(5)(0))
+      val neighborhoodIndexPython = neighborhoodIndex.map(_.toPythonCopy).toPythonCopy
+      val neighborhoodIndexTorch = torch.tensor(neighborhoodIndexPython)
       py.`with`(torch.no_grad()) { _ =>
-        val tensor = torch.tensor(netInput.toPythonCopy).view(1, encoding.elements)
-        val actionIndex = network(tensor).max(1).bracketAccess(1).item().as[Int]
+        val data = network(netInput, neighborhoodIndexTorch)
+        val actionIndex = data.bracketAccess(0).max(0).bracketAccess(1).item().as[Int]
         actionSpace(actionIndex)
+      // actionSpace.head
       }
   }
 }
