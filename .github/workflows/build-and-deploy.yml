@@ -40,7 +40,7 @@ jobs:
       run: pip install --upgrade pip --user
     - name: Install requirements
       run: pip install -r requirements.txt --user
-    - uses: DanySK/build-check-deploy-gradle-action@2.1.26
+    - uses: DanySK/build-check-deploy-gradle-action@2.2.0
       with:
         build-command: true
         check-command: ./gradlew runAllGraphic
