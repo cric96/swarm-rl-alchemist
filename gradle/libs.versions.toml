@@ -1,7 +1,7 @@
 [versions]
 alchemist = "25.14.6"
 kotlin = "1.8.10"
-scalapy = "0.5.3"
+scalapy = "0.5.3+14-95e6ab08"
 logback = "1.4.12"
 
 [libraries]
